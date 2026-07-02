@@ -1,0 +1,242 @@
+name: Vulnerable Pipeline
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: vulnerable-pipeline-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) Build the Spring Boot app once and upload the packaged jar as an
+  #    artifact so the test jobs can download it (faster than rebuilding
+  #    Maven twice, and the app is identical for every test run).
+  # ---------------------------------------------------------------------------
+  build-app:
+    name: Build Spring Boot app
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin, with Maven cache)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Build (skip tests on this intentionally insecure lab)
+        run: mvn -B -ntp -DskipTests package
+
+      - name: Locate packaged jar
+        id: jar
+        run: |
+          JAR=$(ls -1 target/*.jar | grep -v '\.original$' | head -n 1)
+          echo "jar=$JAR" >> "$GITHUB_OUTPUT"
+          echo "Using jar: $JAR"
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-jar
+          path: ${{ steps.jar.outputs.jar }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2) Start the Spring Boot app on localhost:8080 and wait for it to be
+  #    ready. The lab has no /actuator, so we poll the public /login page
+  #    until it returns HTTP 200.
+  # ---------------------------------------------------------------------------
+  start-app:
+    name: Start app (service)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: build-app
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin, with Maven cache)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: Download packaged jar
+        uses: actions/download-artifact@v4
+        with:
+          name: app-jar
+          path: target
+
+      - name: Start Spring Boot in background
+        env:
+          # The lab is intentionally insecure; this is a CI sandbox only.
+          H2_CONSOLE_ENABLED: 'false'
+        run: |
+          JAR=$(ls -1 target/*.jar | grep -v '\.original$' | head -n 1)
+          echo "Launching $JAR on :8080"
+          nohup java -jar "$JAR" > app.log 2>&1 &
+          echo "$!" > app.pid
+          echo "PID=$(cat app.pid)"
+
+      - name: Wait for app to be ready
+        run: |
+          echo "Polling http://localhost:8080/login ..."
+          for i in $(seq 1 60); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/login || echo 000)
+            echo "attempt $i -> HTTP $CODE"
+            if [ "$CODE" = "200" ]; then
+              echo "App is up."
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "App failed to start within 120s. Last 100 log lines:"
+          tail -n 100 app.log || true
+          exit 1
+
+  # ---------------------------------------------------------------------------
+  # 3) Java test stack: Cucumber-JVM + Playwright-Java + REST Assured,
+  #    driven by Surefire inside Playwright_Automation/. The Surefire
+  #    report (target/surefire-reports/**) and the Cucumber HTML/JSON
+  #    (build/reports/**) are uploaded as artifacts even on failure.
+  # ---------------------------------------------------------------------------
+  tests-java:
+    name: Cucumber-JVM + Playwright-Java (BDD)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [build-app, start-app]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin, with Maven cache)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+          # Cache the nested module separately — it has its own pom.xml and
+          # its own ~/.m2 footprint when the test runner pulls REST Assured
+          # and Cucumber-JVM.
+          cache-key: ${{ runner.os }}-maven-playwright-${{ hashFiles('Playwright_Automation/pom.xml') }}
+          cache-restore-keys: |
+            ${{ runner.os }}-maven-playwright-
+
+      - name: Install Playwright OS deps + Chromium for the test module
+        run: |
+          cd Playwright_Automation
+          # Headless browser + system libraries on ubuntu-latest. This is
+          # the Playwright-Java equivalent of `npx playwright install
+          # --with-deps chromium` and is required for VULN-007 (XSS) steps
+          # that drive Chromium against the running app.
+          mvn -B -ntp -q dependency:resolve
+          mvn -B -ntp -q exec:java \
+            -Dexec.mainClass=com.microsoft.playwright.CLI \
+            -Dexec.args="install --with-deps chromium" || true
+
+      - name: Run Cucumber-JVM suite (Surefire)
+        env:
+          # The Playwright-Java client honours the system property below to
+          # pick up the browser binaries that were just installed.
+          PLAYWRIGHT_BROWSERS_PATH: 0
+        run: |
+          cd Playwright_Automation
+          mvn -B -ntp test
+
+      - name: Collect test reports
+        if: always()
+        run: |
+          mkdir -p reports-java
+          # Surefire (JUnit XML + HTML) from the Java test module.
+          find Playwright_Automation/target/surefire-reports -type f \
+            -exec cp --parents {} reports-java/ \; 2>/dev/null || true
+          # Cucumber HTML/JSON from the Java test module.
+          if [ -d Playwright_Automation/build/reports ]; then
+            cp -r Playwright_Automation/build/reports reports-java/cucumber-reports || true
+          fi
+          ls -laR reports-java | head -200
+
+      - name: Upload Java test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-java
+          path: reports-java
+          if-no-files-found: warn
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 4) JavaScript test stack: cucumber-js + @playwright/test. Uses the
+  #    same running app, so it runs in parallel with the Java suite is
+  #    NOT safe — it runs after start-app instead, on the same runner
+  #    pattern would block; we run it serially after the Java job to
+  #    keep the in-memory H2 dataset predictable.
+  # ---------------------------------------------------------------------------
+  tests-js:
+    name: cucumber-js + @playwright/test (BDD)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [build-app, start-app, tests-java]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: Playwright_Automation/package-lock.json
+
+      - name: Install npm dependencies
+        working-directory: Playwright_Automation
+        run: npm ci
+
+      - name: Install Playwright browsers (headless, with OS deps)
+        # `--with-deps` is required on ubuntu-latest: it apt-installs the
+        # native libraries Chromium needs in a headless container.
+        working-directory: Playwright_Automation
+        run: npx playwright install --with-deps chromium
+
+      - name: Run cucumber-js suite
+        env:
+          # Force headless even if a contributor flipped it locally.
+          HEADLESS: 'true'
+          CI: 'true'
+        working-directory: Playwright_Automation
+        run: npx cucumber-js
+
+      - name: Collect test reports
+        if: always()
+        run: |
+          mkdir -p reports-js
+          if [ -d Playwright_Automation/build/reports ]; then
+            cp -r Playwright_Automation/build/reports reports-js/cucumber-reports || true
+          fi
+          if [ -d Playwright_Automation/build/log ]; then
+            cp -r Playwright_Automation/build/log reports-js/ || true
+          fi
+          ls -laR reports-js | head -200
+
+      - name: Upload JS test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-js
+          path: reports-js
+          if-no-files-found: warn
+          retention-days: 30
