@@ -1,0 +1,20 @@
+{
+  "name": "playwright-automation",
+  "version": "1.0.0",
+  "description": "Cucumber-JS + @playwright/test BDD suite verifying OWASP remediations on the Spring Boot lab (http://localhost:8080).",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "cucumber-js",
+    "test:vuln-001": "cucumber-js --tags '@vuln-001'",
+    "test:vuln-002": "cucumber-js --tags '@vuln-002'",
+    "test:vuln-006": "cucumber-js --tags '@vuln-006'",
+    "test:vuln-007": "cucumber-js --tags '@vuln-007'",
+    "report": "node ./scripts/make-html-report.js"
+  },
+  "devDependencies": {
+    "@cucumber/cucumber": "^11.0.0",
+    "@playwright/test": "^1.45.0",
+    "cucumber-html-reporter": "^7.0.0"
+  }
+}
